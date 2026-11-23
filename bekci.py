@@ -20,6 +20,7 @@ Logs decisions (tool + rule id, never content) to BEKCI_LOG, if configured.
 import json
 import os
 import re
+import shlex
 import sys
 import time
 
@@ -44,14 +45,91 @@ SECRET_READERS = re.compile(r"\b(cat|less|more|head|tail|grep|rg|sed|awk|cp|scp|
 ENV_EXAMPLE = re.compile(r"\.env\.(example|sample|template)\b", re.I)
 
 BASH_ASK = [
-    ("push", re.compile(r"\bgit\s+push\b")),
     ("pr", re.compile(r"\bgh\s+(pr\s+(create|merge|comment|review)|issue\s+(create|comment)|release\s+create|repo\s+create)\b")),
     ("publish", re.compile(r"\b(npm|pnpm|yarn)\s+publish\b|\btwine\s+upload\b")),
-    ("reset-hard", re.compile(r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|checkout\s+--?\s*\.)")),
     ("rm-broad", re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b[^;&|]*\s(/|~|\$HOME|/home/[^/]+)(?:/.*)?\s*(?:$|[;&|])")),
     ("dd-mkfs", re.compile(r"\b(mkfs(\.\w+)?|dd\s+if=)")),
 ]
-FORCE_PUSH = re.compile(r"\bgit\s+push\b.*(--force\b|-f\b|--force-with-lease)")
+GIT_GLOBAL_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+GIT_GLOBAL_FLAGS = {"--no-pager"}
+
+
+def git_actions(command):
+    """Yield git subcommands from shell syntax, including common wrappers."""
+    try:
+        tokens = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        tokens.whitespace_split = True
+        tokens.commenters = "#"
+        words = list(tokens)
+    except ValueError:
+        return
+
+    # Split shell command lists so quoted strings remain a single inert token.
+    chunks, chunk = [], []
+    for word in words:
+        if word in (";", "&&", "||", "|", "&"):
+            if chunk:
+                chunks.append(chunk)
+                chunk = []
+        else:
+            chunk.append(word)
+    if chunk:
+        chunks.append(chunk)
+
+    for argv in chunks:
+        i = 0
+        while i < len(argv):
+            word = argv[i]
+            if os.path.basename(word) in ("env", "command", "builtin", "exec"):
+                i += 1
+                continue
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word):
+                i += 1
+                continue
+            if os.path.basename(word) == "git":
+                i += 1
+                while i < len(argv):
+                    opt = argv[i]
+                    if opt in GIT_GLOBAL_FLAGS:
+                        i += 1
+                    elif opt in GIT_GLOBAL_VALUE_OPTIONS:
+                        i += 2
+                    elif any(opt.startswith(name + "=") for name in ("--git-dir", "--work-tree", "--namespace")):
+                        i += 1
+                    elif opt.startswith("-") and opt != "-":
+                        i += 1
+                    else:
+                        break
+                if i < len(argv):
+                    action = argv[i]
+                    yield action, argv[i + 1:]
+                break
+            if os.path.basename(word) in {"sh", "bash", "dash", "zsh"}:
+                try:
+                    c_index = argv.index("-c", i + 1)
+                    if c_index + 1 < len(argv):
+                        yield from git_actions(argv[c_index + 1])
+                except ValueError:
+                    pass
+                break
+            # Skip leading command options such as /usr/bin/env -i.
+            if word.startswith("-"):
+                i += 1
+                continue
+            break
+
+
+def git_rule(command):
+    for action, args in git_actions(command):
+        if action == "push":
+            return "force-push" if any(a in ("--force", "-f", "--force-with-lease") for a in args) else "push"
+        if action == "reset" and "--hard" in args:
+            return "reset-hard"
+        if action == "clean" and any(re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", a) for a in args):
+            return "reset-hard"
+        if action == "checkout" and "--" in args and any(a in (".", ".\\") for a in args[args.index("--") + 1:]):
+            return "reset-hard"
+    return None
 
 MCP_ASK = re.compile(
     r"^mcp__.*(Gmail__(send_message|reply|forward)|Calendar__(create_event|delete_event|respond_to_event)|"
@@ -75,12 +153,16 @@ def decide_builtin(event):
 
     cmd = shell_command(tool, inp)
     if cmd is not None:
-        if re.search(r"\b(git\s+commit|gh\s+(pr|issue|release))\b", cmd) and AI_TRAILER.search(cmd):
+        wrapped_commit = any(action == "commit" for action, _ in git_actions(cmd))
+        if (wrapped_commit or re.search(r"\bgh\s+(pr|issue|release)\b", cmd)) and AI_TRAILER.search(cmd):
             return "deny", "ai-izi", "AI attribution trailer detected. Remove it before committing."
         if SECRET_READERS.search(cmd) and SECRET_PATH.search(cmd) and not ENV_EXAMPLE.search(cmd):
             return "deny", "sir", "A credential file cannot be read by the hook caller."
-        if FORCE_PUSH.search(cmd):
+        git_rule_id = git_rule(cmd)
+        if git_rule_id == "force-push":
             return "ask", "force-push", "Force push requires explicit approval."
+        if git_rule_id:
+            return "ask", git_rule_id, f"External or irreversible action ({git_rule_id}) requires explicit approval."
         for rid, rx in BASH_ASK:
             if rx.search(cmd):
                 return "ask", rid, f"External or irreversible action ({rid}) requires explicit approval."

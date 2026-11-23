@@ -35,6 +35,25 @@ CASES = [
     (R("/home/user/workspace/token-cache.json"), None),
     (B("git push origin main"), "ask"),
     (B("git push --force origin main"), "ask"),
+    (B('git -C "/tmp/a repo" push origin main'), "ask"),
+    (B('git -c user.name="A B" push origin main'), "ask"),
+    (B('git --git-dir="/tmp/a repo/.git" push origin main'), "ask"),
+    (B('git --work-tree="/tmp/a repo" --no-pager push origin main'), "ask"),
+    (B('git --namespace team push origin main'), "ask"),
+    (B('env FOO=bar git -C "/tmp/a repo" push origin main'), "ask"),
+    (B('command git push origin main'), "ask"),
+    (B('/usr/bin/git push origin main'), "ask"),
+    (B('sh -c "git push origin main"'), "ask"),
+    (B('git -C "/tmp/a repo" push --force-with-lease origin main'), "ask"),
+    (B('git -C "/tmp/a repo" push -f origin main'), "ask"),
+    (B('env X=1 git -C "/tmp/a repo" reset --hard HEAD'), "ask"),
+    (B('command git --no-pager clean -fd'), "ask"),
+    (B("sh -c 'git -C \"/tmp/a repo\" reset --hard HEAD'"), "ask"),
+    (B('git log --grep push'), None),
+    (B('echo "git push"'), None),
+    (B("echo 'git reset --hard'"), None),
+    (B('env X=1 git -C "/tmp/a repo" commit -m "Co-Authored-By: Claude"'), "deny"),
+    (B('echo "git commit -m Co-Authored-By: Claude"'), None),
     (B("rm -rf ~/"), "ask"),
     (B("rm -rf /home/user/*"), "ask"),
     (B("rm -rf ./build"), None),
@@ -125,4 +144,10 @@ for ok, name in extra[-3:]:
         print("FAIL", name)
 total = len(CASES) + len(extra)
 print(f"{total - fail}/{total} ok")
-sys.exit(1 if fail else 0)
+def test_bekci_cases():
+    assert fail == 0
+    assert total == 76
+
+
+if __name__ == "__main__":
+    sys.exit(1 if fail else 0)

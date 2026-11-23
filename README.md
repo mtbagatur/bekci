@@ -5,6 +5,9 @@ checks shell commands, file access, and supported MCP actions before a tool
 runs. Built-in protections cover credential files, AI attribution trailers,
 external actions, and destructive commands. Optional Markdown rules can add
 `deny`, `ask`, or `warn` decisions; they cannot weaken built-in protections.
+An active malformed rule fails closed: it produces an `ask` decision for its
+event type (or all event types when `olay` is invalid). Codex converts that
+`ask` to `deny`, like other approval requests.
 
 ## Requirements
 
@@ -81,8 +84,16 @@ Each rule uses a heading and four fields:
 ```
 
 `olay` accepts `bash`, `file`, `yaz`, `mcp`, or `all`. `karar` accepts
-`deny`, `ask`, or `warn`. Add `- kapalı` to disable a rule. Invalid rules are
-skipped and logged.
+`deny`, `ask`, or `warn`. Add `- kapalı` to disable a rule. Malformed active
+rules are reported as `ask` decisions and logged as `kural-hata:<id>`; disabled
+rules remain inactive. Validate the file before installing changes:
+
+```sh
+python3 -I bekci.py --check [path]
+```
+
+The command prints each malformed rule and exits 1 if any are found, otherwise
+exits 0.
 
 ## Run tests
 

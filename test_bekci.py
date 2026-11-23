@@ -3,6 +3,12 @@ import json
 """Run: python3 -I test_bekci.py"""
 import os
 import sys
+import tempfile
+
+_TEST_DIR = tempfile.mkdtemp(prefix="bekci-test-")
+os.environ["BEKCI_LOG"] = os.path.join(_TEST_DIR, "test.log")
+_LIVE_LOG = os.path.expanduser("~/ortak/kokpit/bekci.log")
+_LIVE_LOG_STATE = (os.path.getsize(_LIVE_LOG), os.stat(_LIVE_LOG).st_mtime_ns) if os.path.exists(_LIVE_LOG) else None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bekci  # noqa: E402
@@ -68,23 +74,33 @@ for ev, want in CASES:
     if got != want:
         fail += 1
         print("FAIL", want, got, ev)
-# md cannot loosen the floor; broken and disabled rules are skipped
+# md cannot loosen the floor; broken rules fail closed and disabled rules stay inactive
 import tempfile  # noqa: E402
 with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
     f.write("### gevset\n- olay: bash\n- karar: warn\n- desen: `git push`\n"
             "### bozuk\n- olay: bash\n- karar: deny\n- desen: `([`\n"
+            "### olay-bozuk\n- olay: mystery\n- karar: deny\n- desen: `ls`\n"
+            "### karar-bozuk\n- olay: bash\n- karar: maybe\n- desen: `rm`\n"
+            "### desen-yok\n- olay: bash\n- karar: ask\n"
             "### kapali-kural\n- olay: bash\n- karar: deny\n- desen: `ls`\n- kapalı\n")
-rules = bekci.load_rules(f.name)
+broken = []
+rules = bekci.load_rules(f.name, broken)
 os.unlink(f.name)
 extra = [
-    ([r["id"] for r in rules] == ["gevset"], "bad/disabled rules skipped"),
+    ([r["id"] for r in rules] == ["gevset"], "disabled rule excluded"),
+    (bekci.decide(B("echo hello"), rules, broken)[0] == "ask", "broken bash rule asks"),
+    (bekci.decide(R("/tmp/file"), rules, broken)[0] == "ask", "invalid olay asks on all"),
+    (bekci.decide(B("git push"), rules, broken)[0] == "ask", "deny floor stays stricter than broken ask"),
+    (all(x["id"] != "kapali-kural" for x in broken), "disabled broken rule inactive"),
     (bekci.decide(B("git push"), rules)[0] == "ask", "md cannot loosen push"),
     (bekci.decide(B("ls"), rules) is None, "disabled rule inactive"),
 ]
 import subprocess
 def run(ev):
+    rules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bekci-kurallar.md")
+    env = dict(os.environ, BEKCI_LOG=os.path.join(_TEST_DIR, "subprocess.log"), BEKCI_KURALLAR=rules_path)
     r = subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bekci.py")],
-                       input=json.dumps(ev), capture_output=True, text=True)
+                       input=json.dumps(ev), capture_output=True, text=True, env=env)
     return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else None
 push = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "git push origin main"}}
 extra += [
@@ -92,6 +108,18 @@ extra += [
     (run(dict(push, turn_id="t1")) == "deny", "codex push ask->deny"),
 ]
 for ok, name in extra:
+    if not ok:
+        fail += 1
+        print("FAIL", name)
+check_clean = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "bekci.py"), "--check", os.path.join(os.path.dirname(__file__), "bekci-kurallar.md")], capture_output=True, text=True)
+with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as badf:
+    badf.write("### broken\n- olay: bash\n- karar: ask\n- desen: `([`\n")
+check_bad = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "bekci.py"), "--check", badf.name], capture_output=True, text=True)
+extra += [(check_clean.returncode == 0, "--check clean exits 0"),
+          (check_bad.returncode == 1 and "broken:" in check_bad.stdout, "--check broken exits 1")]
+live_log_unchanged = (_LIVE_LOG_STATE == ((os.path.getsize(_LIVE_LOG), os.stat(_LIVE_LOG).st_mtime_ns) if os.path.exists(_LIVE_LOG) else None))
+extra.append((live_log_unchanged and os.path.realpath(bekci.LOG) != os.path.realpath(_LIVE_LOG), "test run never touches live log"))
+for ok, name in extra[-3:]:
     if not ok:
         fail += 1
         print("FAIL", name)

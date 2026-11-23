@@ -10,10 +10,11 @@ ai-job-search (.claude/settings.json deny list), rewritten for our rules:
 
 Extra rules live in a Markdown file selected with BEKCI_KURALLAR. Built-in
 rules are the floor: Markdown rules can add deny/ask/warn but cannot loosen
-them. A broken rule is skipped and logged. Codex hook events are supported.
+them. Broken rules fail closed with an ask decision. Codex hook events are supported.
 
 Reads the hook JSON on stdin, prints a decision JSON only when it acts.
 Fails open (exit 0, no output) on bad input so a bug never bricks a session.
+Use --check [path] to validate the Markdown rules file.
 Logs decisions (tool + rule id, never content) to BEKCI_LOG, if configured.
 """
 import json
@@ -100,31 +101,36 @@ def decide_builtin(event):
     return None
 
 
-def load_rules(path=None):
-    """Parse bekci-kurallar.md. Block format:
-    ### <id>
-    - olay: bash | file | yaz (Edit/Write only) | mcp | all
-    - karar: deny | ask | warn
-    - desen: `<python regex>`
-    - mesaj: <text>
-    - kapalı            (optional: disables the rule)
-    """
+def load_rules(path=None, broken=None):
+    """Parse rules; append malformed active rules to *broken* with reasons."""
     rules, cur = [], None
+    broken = broken if broken is not None else []
     try:
-        lines = open(path or RULES_MD, encoding="utf-8").read().splitlines()
-    except OSError:
+        with open(path or RULES_MD, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as exc:
+        broken.append({"id": "?", "olay": "all", "reason": f"cannot read rules file: {exc}"})
         return rules
 
     def close(r):
         if not r or r.get("kapali"):
             return
-        try:
-            assert r.get("olay") in ("bash", "file", "yaz", "mcp", "all")
-            assert r.get("karar") in RANK
-            r["rx"] = re.compile(r["desen"], re.I)
+        reason = None
+        if r.get("olay") not in ("bash", "file", "yaz", "mcp", "all"):
+            reason = f"invalid or missing olay: {r.get('olay', '<missing>')}"
+        elif r.get("karar") not in RANK:
+            reason = f"invalid or missing karar: {r.get('karar', '<missing>')}"
+        elif not r.get("desen"):
+            reason = "missing desen"
+        else:
+            try:
+                r["rx"] = re.compile(r["desen"], re.I)
+            except re.error as exc:
+                reason = f"invalid regex: {exc}"
+        if reason:
+            broken.append({"id": r.get("id", "?"), "olay": r.get("olay"), "reason": reason})
+        else:
             rules.append(r)
-        except (AssertionError, KeyError, re.error):
-            log("-", "kural-hata:" + r.get("id", "?"), "skip")
 
     for line in lines:
         m = re.match(r"^###\s+(\S+)", line)
@@ -171,15 +177,39 @@ def decide_rules(event, rules):
     return None
 
 
-def decide(event, rules=None):
+def decide(event, rules=None, broken=None):
     """Built-in floor first; md rules can only add stricter outcomes."""
     base = decide_builtin(event)
     if rules is None:
-        rules = load_rules()
+        if broken is None:
+            broken = []
+        rules = load_rules(broken=broken)
+    if broken is None:
+        broken = []
     extra = decide_rules(event, rules)
-    if base and (not extra or RANK[base[0]] >= RANK[extra[0]]):
+    tool = event.get("tool_name", "")
+    cmd = shell_command(tool, event.get("tool_input") or {})
+    if cmd is not None:
+        kind = "bash"
+    elif tool in ("Read", "Edit", "Write", "NotebookEdit", "MultiEdit"):
+        kind = "file"
+    elif tool.startswith("mcp__"):
+        kind = "mcp"
+    else:
+        kind = "other"
+    broken_result = None
+    if kind:
+        for item in broken:
+            bad_kind = item.get("olay")
+            if bad_kind not in ("bash", "file", "yaz", "mcp", "all") or bad_kind == "all" or bad_kind == kind or (bad_kind == "yaz" and kind == "file" and tool != "Read"):
+                broken_result = ("ask", "kural-hata:" + item["id"], f"Bekci: broken rule {item['id']}: {item['reason']}; fix bekci-kurallar.md")
+                break
+    strict_extra = extra
+    if broken_result and (not strict_extra or RANK["ask"] > RANK[strict_extra[0]]):
+        strict_extra = broken_result
+    if base and (not strict_extra or RANK[base[0]] > RANK[strict_extra[0]]):
         return base
-    return extra or base
+    return strict_extra or base
 
 
 def is_codex(event):
@@ -195,6 +225,13 @@ def log(tool, rule, decision):
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--check":
+        path = sys.argv[2] if len(sys.argv) > 2 else RULES_MD
+        broken = []
+        load_rules(path, broken)
+        for item in broken:
+            print(f"{item['id']}: {item['reason']}")
+        return 1 if broken else 0
     try:
         event = json.load(sys.stdin)
     except (ValueError, OSError):
@@ -208,7 +245,8 @@ def main():
         # run without an approval mechanism.
         decision = "deny"
         reason += " (Codex has no approval prompt: blocked.)"
-    log(("codex:" if is_codex(event) else "") + event.get("tool_name", ""), rule, decision)
+    logged_decision = "ask" if rule.startswith("kural-hata:") else decision
+    log(("codex:" if is_codex(event) else "") + event.get("tool_name", ""), rule, logged_decision)
     if decision == "warn":
         print(json.dumps({
             "hookSpecificOutput": {
